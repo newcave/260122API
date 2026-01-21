@@ -1,14 +1,14 @@
+import importlib.util
 import os
 from dataclasses import dataclass
 from io import BytesIO
-from typing import List, Optional
+from typing import Any, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import pdfplumber
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from openai import OpenAI
 from pypdf import PdfReader
 
 APP_TITLE = "K-water 보고서 요약 에이전트"
@@ -81,7 +81,7 @@ def chunk_text(text: str, max_chars: int = 6000, overlap: int = 400) -> List[str
     return chunks
 
 
-def summarize_text(client: OpenAI, model: str, text: str) -> str:
+def summarize_text(client: Any, model: str, text: str) -> str:
     chunks = chunk_text(text)
     summaries = []
     for chunk in chunks:
@@ -106,7 +106,12 @@ def summarize_text(client: OpenAI, model: str, text: str) -> str:
     return response.choices[0].message.content.strip()
 
 
-def get_openai_client(api_key: str) -> OpenAI:
+def get_openai_client(api_key: str) -> Any:
+    if importlib.util.find_spec("openai") is None:
+        st.error("OpenAI 라이브러리가 설치되지 않았습니다. requirements.txt를 확인하세요.")
+        st.stop()
+    from openai import OpenAI
+
     return OpenAI(api_key=api_key)
 
 
