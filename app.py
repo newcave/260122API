@@ -118,7 +118,7 @@ with st.sidebar:
         "OpenAI API Key",
         type="password",
         value=st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-        help="Streamlit Cloud에서는 Secrets에 저장한 키를 자동으로 사용합니다.",
+        help="Streamlit Cloud에서는 secrets.toml에 저장한 키를 자동으로 사용합니다.",
     )
     model = st.selectbox("모델", ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"], index=1)
     preview_limit = st.slider("텍스트 미리보기 길이", min_value=300, max_value=2000, value=800)
