@@ -1,0 +1,4 @@
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+pdfplumber>=0.11.0
+pypdf>=4.2.0
