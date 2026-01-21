@@ -1,6 +1,7 @@
-# =========================
-# Imports
-# =========================
+# ======================================================
+# K-water 연구보고서 요약 에이전트 (표준 A)
+# ======================================================
+
 import os
 from dataclasses import dataclass
 from io import BytesIO
@@ -14,39 +15,53 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from pypdf import PdfReader
 
-# =========================
-# App Configuration
-# =========================
-APP_TITLE = "K-water 보고서 요약 에이전트"
-
-SYSTEM_PROMPT = (
-    "당신은 수자원 및 공공 정책 전문가입니다. "
-    "제공된 보고서의 핵심 내용, 연구 목적, 주요 결과, 정책적 시사점을 "
-    "Markdown 형식으로 명확하게 요약하세요."
-)
+# ======================================================
+# App Config
+# ======================================================
+APP_TITLE = "K-water 연구보고서 요약 에이전트 (표준 A)"
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# =========================
-# Data Class
-# =========================
+# ======================================================
+# K-water Standard A System Prompt
+# ======================================================
+SYSTEM_PROMPT = """
+당신은 한국수자원공사(K-water) 및 공공기관 연구보고서를 전문적으로 분석하는 정책·기술 전문가입니다.
+
+아래 보고서를 'K-water 연구보고서 표준 A 요약 형식'에 맞춰 요약하십시오.
+
+[요약 작성 원칙]
+- 객관적이고 공공기관 문체 사용
+- 불필요한 수식어 제거
+- 정책·실무 활용 관점 강조
+- Markdown 형식 사용
+
+[출력 형식 — 반드시 아래 구조 유지]
+
+## 1. 연구 배경 및 필요성
+## 2. 연구 목적
+## 3. 연구 범위 및 방법
+## 4. 주요 연구 결과
+## 5. 정책적·실무적 시사점
+## 6. 결론 및 향후 과제
+"""
+
+# ======================================================
+# Data Model
+# ======================================================
 @dataclass
 class ReportSource:
     pdf_url: Optional[str]
     text: str
 
-# =========================
-# Utility Functions
-# =========================
+# ======================================================
+# Web & PDF Utilities
+# ======================================================
 def fetch_html(url: str, timeout: int = 12) -> str:
-    response = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=timeout,
-    )
+    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
     response.raise_for_status()
     return response.text
 
@@ -66,33 +81,24 @@ def scrape_pdf_links(page_url: str) -> List[str]:
 
 
 def download_pdf(url: str, timeout: int = 20) -> bytes:
-    response = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=timeout,
-    )
+    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
     response.raise_for_status()
     return response.content
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    text = ""
-
-    # 1️⃣ pdfplumber (best for digital PDFs)
+    # 1) pdfplumber 우선
     try:
         with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-            pages = [page.extract_text() or "" for page in pdf.pages]
-        text = "\n".join(pages).strip()
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+        if text:
+            return text
     except Exception:
         pass
 
-    if text:
-        return text
-
-    # 2️⃣ pypdf fallback
+    # 2) pypdf fallback
     reader = PdfReader(BytesIO(pdf_bytes))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(pages).strip()
+    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
 
 def chunk_text(text: str, max_chars: int = 6000, overlap: int = 400) -> List[str]:
@@ -107,10 +113,16 @@ def chunk_text(text: str, max_chars: int = 6000, overlap: int = 400) -> List[str
 
     return chunks
 
+# ======================================================
+# OpenAI Summarization Logic
+# ======================================================
+def get_openai_client() -> OpenAI:
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found")
+    return OpenAI(api_key=api_key)
 
-# =========================
-# OpenAI Summarization
-# =========================
+
 def summarize_text(client: OpenAI, model: str, text: str) -> str:
     chunks = chunk_text(text)
     partial_summaries = []
@@ -125,9 +137,11 @@ def summarize_text(client: OpenAI, model: str, text: str) -> str:
         )
         partial_summaries.append(response.output_text.strip())
 
+    # 단일 청크
     if len(partial_summaries) == 1:
         return partial_summaries[0]
 
+    # 통합 요약
     combined = "\n\n".join(partial_summaries)
 
     final_response = client.responses.create(
@@ -140,78 +154,60 @@ def summarize_text(client: OpenAI, model: str, text: str) -> str:
 
     return final_response.output_text.strip()
 
-
-def get_openai_client() -> OpenAI:
-    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not found")
-    return OpenAI(api_key=api_key)
-
-# =========================
+# ======================================================
 # Streamlit UI
-# =========================
+# ======================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="💧", layout="wide")
 st.title(APP_TITLE)
 
 with st.sidebar:
-    st.header("설정")
+    st.header("요약 설정")
     model = st.selectbox(
-        "모델",
+        "모델 선택",
         ["gpt-4o-mini", "gpt-4o"],
         index=0,
     )
-    preview_limit = st.slider(
-        "텍스트 미리보기 길이",
-        min_value=300,
-        max_value=2000,
-        value=800,
-    )
+    preview_limit = st.slider("원문 미리보기 길이", 300, 2000, 800)
 
+# ======================================================
+# Input Section
+# ======================================================
 st.subheader("보고서 입력")
 
 url_input = st.text_input(
     "ALIO 게시글 URL",
-    placeholder="https://alio.go.kr/item/itemDetail.do?...",
+    placeholder="https://alio.go.kr/item/itemDetail.do?..."
 )
 
-uploaded_pdf = st.file_uploader(
-    "PDF 파일 직접 업로드",
-    type=["pdf"],
-)
+uploaded_pdf = st.file_uploader("PDF 직접 업로드", type=["pdf"])
 
-# =========================
-# Session State
-# =========================
-for key in [
-    "report_text",
-    "report_source",
-    "summary",
-    "pdf_links",
-    "scrape_warning",
-]:
+# ======================================================
+# Session State Init
+# ======================================================
+for key in ["report_text", "report_source", "summary", "pdf_links", "warning"]:
     if key not in st.session_state:
         st.session_state[key] = "" if key != "pdf_links" else []
 
-# =========================
+# ======================================================
 # Load Report
-# =========================
+# ======================================================
 if st.button("보고서 불러오기", type="primary"):
     st.session_state.summary = ""
     st.session_state.report_text = ""
     st.session_state.report_source = None
     st.session_state.pdf_links = []
-    st.session_state.scrape_warning = ""
+    st.session_state.warning = ""
 
     if not url_input and not uploaded_pdf:
-        st.warning("URL 또는 PDF 파일을 입력해주세요.")
+        st.warning("URL 또는 PDF 파일을 입력하세요.")
     else:
         if url_input:
             try:
                 st.session_state.pdf_links = scrape_pdf_links(url_input)
                 if not st.session_state.pdf_links:
-                    st.session_state.scrape_warning = "PDF 링크를 찾지 못했습니다."
+                    st.session_state.warning = "PDF 링크를 찾지 못했습니다."
             except Exception:
-                st.session_state.scrape_warning = "스크래핑이 차단되었습니다."
+                st.session_state.warning = "ALIO 페이지 접근이 차단되었습니다."
 
         if uploaded_pdf:
             try:
@@ -219,53 +215,47 @@ if st.button("보고서 불러오기", type="primary"):
                 st.session_state.report_text = text
                 st.session_state.report_source = ReportSource("업로드된 파일", text)
             except Exception:
-                st.error("PDF 파싱 오류가 발생했습니다.")
+                st.error("PDF 파싱 실패")
 
-# =========================
+# ======================================================
 # PDF Selection
-# =========================
-if st.session_state.scrape_warning:
-    st.warning(st.session_state.scrape_warning)
+# ======================================================
+if st.session_state.warning:
+    st.warning(st.session_state.warning)
 
 if st.session_state.pdf_links:
-    selected_pdf = st.selectbox("발견된 PDF 링크", st.session_state.pdf_links)
+    selected_pdf = st.selectbox("발견된 PDF 목록", st.session_state.pdf_links)
     if st.button("선택한 PDF 불러오기"):
-        try:
-            pdf_bytes = download_pdf(selected_pdf)
-            text = extract_text_from_pdf(pdf_bytes)
-            st.session_state.report_text = text
-            st.session_state.report_source = ReportSource(selected_pdf, text)
-        except Exception:
-            st.error("PDF 다운로드 또는 파싱 실패")
+        pdf_bytes = download_pdf(selected_pdf)
+        text = extract_text_from_pdf(pdf_bytes)
+        st.session_state.report_text = text
+        st.session_state.report_source = ReportSource(selected_pdf, text)
 
 if st.session_state.report_source:
     st.success("보고서 로딩 완료")
-    st.caption(f"사용한 소스: {st.session_state.report_source.pdf_url}")
+    st.caption(f"소스: {st.session_state.report_source.pdf_url}")
 
-# =========================
+# ======================================================
 # Summarization
-# =========================
+# ======================================================
 st.divider()
-st.subheader("요약")
+st.subheader("표준 A 요약 결과")
 
 if st.button("요약 생성"):
     if not st.session_state.report_text:
-        st.warning("먼저 보고서를 불러오세요.")
+        st.warning("보고서를 먼저 불러오세요.")
     else:
-        try:
-            client = get_openai_client()
-            with st.spinner("요약 생성 중..."):
-                st.session_state.summary = summarize_text(
-                    client,
-                    model,
-                    st.session_state.report_text,
-                )
-        except Exception as e:
-            st.error(f"요약 생성 오류: {e}")
+        client = get_openai_client()
+        with st.spinner("K-water 표준 A 요약 생성 중..."):
+            st.session_state.summary = summarize_text(
+                client,
+                model,
+                st.session_state.report_text,
+            )
 
 if st.session_state.summary:
     st.markdown(st.session_state.summary)
 
 if st.session_state.report_text:
-    with st.expander("원본 텍스트 미리보기"):
+    with st.expander("원문 미리보기"):
         st.write(st.session_state.report_text[:preview_limit])
