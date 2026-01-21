@@ -1,241 +1,211 @@
-import importlib.util
+# ======================================================
+# ALIO 연구보고서 수집 + K-water 표준 A 요약 에이전트
+# (A안: 내부 JSON API 기반)
+# ======================================================
+
 import os
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, List, Optional
-from urllib.parse import urljoin, urlparse
+from typing import List, Dict, Optional
 
-import pdfplumber
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
+import pdfplumber
 from pypdf import PdfReader
+from openai import OpenAI
 
-APP_TITLE = "K-water 보고서 요약 에이전트"
-SYSTEM_PROMPT = (
-    "당신은 수자원 및 공공 정책 전문가입니다. 제공된 보고서의 핵심 내용, "
-    "연구 목적, 결론을 요약하여 Markdown 형식으로 출력하세요."
-)
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+# ======================================================
+# 기본 설정
+# ======================================================
+APP_TITLE = "ALIO 연구보고서 요약 에이전트 (K-water 표준 A)"
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://alio.go.kr",
+}
 
+# ======================================================
+# K-water 표준 A 프롬프트
+# ======================================================
+SYSTEM_PROMPT = """
+당신은 한국수자원공사(K-water) 및 공공기관 연구보고서를 전문적으로 분석하는 정책·기술 전문가입니다.
+
+아래 보고서를 'K-water 연구보고서 표준 A 요약 형식'에 맞춰 요약하십시오.
+
+[출력 형식 — 반드시 준수]
+
+## 1. 연구 배경 및 필요성
+## 2. 연구 목적
+## 3. 연구 범위 및 방법
+## 4. 주요 연구 결과
+## 5. 정책적·실무적 시사점
+## 6. 결론 및 향후 과제
+"""
+
+# ======================================================
+# 데이터 모델
+# ======================================================
 @dataclass
-class ReportSource:
+class ReportItem:
+    title: str
+    detail_url: str
     pdf_url: Optional[str]
-    text: str
 
+# ======================================================
+# ALIO 내부 API 접근 (A안 핵심)
+# ======================================================
+def fetch_alio_report_list(
+    apba_id: str,
+    report_form_root_no: str,
+    page: int = 1,
+    page_size: int = 50,
+) -> List[Dict]:
+    """
+    ALIO 연구보고서 목록 JSON 호출
+    ※ 실제 브라우저 Network 탭에서 확인되는 엔드포인트 패턴
+    """
 
-def fetch_html(url: str, timeout: int = 12) -> str:
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    api_url = "https://alio.go.kr/iris/api/report/list"
+
+    payload = {
+        "apbaId": apba_id,
+        "reportFormRootNo": report_form_root_no,
+        "pageIndex": page,
+        "pageSize": page_size,
+    }
+
+    response = requests.post(api_url, json=payload, headers=HEADERS, timeout=15)
     response.raise_for_status()
-    return response.text
+    data = response.json()
+
+    return data.get("list", [])
 
 
-def scrape_pdf_links(page_url: str) -> List[str]:
-    html = fetch_html(page_url)
-    soup = BeautifulSoup(html, "lxml")
-    base_url = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
-    links = []
-    for anchor in soup.select("a[href]"):
-        href = anchor.get("href", "")
-        lower_href = href.lower()
-        if ".pdf" in lower_href or "filedown" in lower_href or "download" in lower_href:
-            links.append(urljoin(base_url, href))
-    deduped = list(dict.fromkeys(links))
-    return deduped
-
-
-def download_pdf(url: str, timeout: int = 20) -> bytes:
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+def extract_pdf_url(detail_api_url: str) -> Optional[str]:
+    """
+    상세 페이지 JSON에서 PDF 다운로드 URL 추출
+    """
+    response = requests.get(detail_api_url, headers=HEADERS, timeout=15)
     response.raise_for_status()
-    return response.content
+    data = response.json()
+
+    for file in data.get("attachFiles", []):
+        if file.get("fileExt", "").lower() == "pdf":
+            return file.get("downloadUrl")
+
+    return None
+
+
+# ======================================================
+# PDF 처리
+# ======================================================
+def download_pdf(url: str) -> bytes:
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.content
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        pages_text = [page.extract_text() or "" for page in pdf.pages]
-    text = "\n".join(pages_text).strip()
-    if text:
-        return text
+    try:
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
     reader = PdfReader(BytesIO(pdf_bytes))
-    pages_text = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(pages_text).strip()
+    return "\n".join(p.extract_text() or "" for p in reader.pages)
 
 
-def chunk_text(text: str, max_chars: int = 6000, overlap: int = 400) -> List[str]:
+def chunk_text(text: str, size: int = 6000, overlap: int = 400):
     chunks = []
     start = 0
-    text_length = len(text)
-    while start < text_length:
-        end = min(start + max_chars, text_length)
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap
-        if start < 0:
-            start = 0
-        if end == text_length:
-            break
+    while start < len(text):
+        end = min(start + size, len(text))
+        chunks.append(text[start:end])
+        start = end - overlap if end < len(text) else end
     return chunks
 
 
-def summarize_text(client: Any, model: str, text: str) -> str:
-    chunks = chunk_text(text)
+# ======================================================
+# OpenAI 요약
+# ======================================================
+def get_openai_client() -> OpenAI:
+    key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=key)
+
+
+def summarize_text(client: OpenAI, model: str, text: str) -> str:
     summaries = []
-    for chunk in chunks:
-        response = client.chat.completions.create(
+
+    for chunk in chunk_text(text):
+        r = client.responses.create(
             model=model,
-            messages=[
+            input=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": chunk},
             ],
         )
-        summaries.append(response.choices[0].message.content.strip())
-    if len(summaries) == 1:
-        return summaries[0]
-    combined = "\n\n".join(summaries)
-    response = client.chat.completions.create(
+        summaries.append(r.output_text)
+
+    combined = "\n".join(summaries)
+
+    r = client.responses.create(
         model=model,
-        messages=[
+        input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": combined},
         ],
     )
-    return response.choices[0].message.content.strip()
+    return r.output_text
 
 
-def get_openai_client(api_key: str) -> Any:
-    if importlib.util.find_spec("openai") is None:
-        st.error("OpenAI 라이브러리가 설치되지 않았습니다. requirements.txt를 확인하세요.")
-        st.stop()
-    from openai import OpenAI
-
-    return OpenAI(api_key=api_key)
-
-
+# ======================================================
+# Streamlit UI
+# ======================================================
 st.set_page_config(page_title=APP_TITLE, page_icon="💧", layout="wide")
-
-with st.sidebar:
-    st.header("설정")
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        value=st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-        help="Streamlit Cloud에서는 secrets.toml에 저장한 키를 자동으로 사용합니다.",
-    )
-    model = st.selectbox("모델", ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"], index=1)
-    preview_limit = st.slider("텍스트 미리보기 길이", min_value=300, max_value=2000, value=800)
-
 st.title(APP_TITLE)
 
-st.subheader("보고서 입력")
-url_input = st.text_input(
-    "ALIO 게시글 URL",
-    placeholder="https://alio.go.kr/item/itemDetail.do?...",
-)
-uploaded_pdf = st.file_uploader("PDF 파일 직접 업로드", type=["pdf"])
+with st.sidebar:
+    st.header("ALIO 검색 설정")
+    apba_id = st.text_input("기관 코드 (apbaId)", value="C0221")
+    report_root = st.text_input("보고서 유형 코드", value="B1040")
+    model = st.selectbox("모델", ["gpt-4o-mini", "gpt-4o"])
 
-if "report_text" not in st.session_state:
-    st.session_state.report_text = ""
-if "report_source" not in st.session_state:
-    st.session_state.report_source = None
-if "summary" not in st.session_state:
-    st.session_state.summary = ""
-if "pdf_links" not in st.session_state:
-    st.session_state.pdf_links = []
-if "scrape_warning" not in st.session_state:
-    st.session_state.scrape_warning = ""
+st.subheader("연구보고서 목록 조회")
 
-load_button = st.button("보고서 불러오기", type="primary")
+if st.button("ALIO 연구보고서 조회"):
+    try:
+        items = fetch_alio_report_list(apba_id, report_root)
+        st.session_state.items = items
+        st.success(f"{len(items)}건 조회됨")
+    except Exception as e:
+        st.error(f"조회 실패: {e}")
 
-if load_button:
-    st.session_state.summary = ""
-    st.session_state.report_text = ""
-    st.session_state.report_source = None
-    st.session_state.pdf_links = []
-    st.session_state.scrape_warning = ""
+if "items" in st.session_state:
+    titles = [item.get("reportTitle") for item in st.session_state.items]
+    idx = st.selectbox("보고서 선택", range(len(titles)), format_func=lambda i: titles[i])
 
-    if not url_input and not uploaded_pdf:
-        st.warning("URL 또는 PDF 파일을 입력해주세요.")
-    else:
-        if url_input:
-            try:
-                st.session_state.pdf_links = scrape_pdf_links(url_input)
-                if not st.session_state.pdf_links:
-                    st.session_state.scrape_warning = (
-                        "스크래핑이 차단되었습니다. PDF를 직접 업로드해주세요."
-                    )
-            except requests.RequestException:
-                st.session_state.scrape_warning = (
-                    "스크래핑이 차단되었습니다. PDF를 직접 업로드해주세요."
-                )
-        if uploaded_pdf is not None:
-            pdf_bytes = uploaded_pdf.read()
-            try:
-                report_text = extract_text_from_pdf(pdf_bytes)
-            except Exception:
-                st.error("PDF 파싱 오류가 발생했습니다. 다른 파일을 업로드해주세요.")
-                report_text = ""
-            if report_text:
-                st.session_state.report_text = report_text
-                st.session_state.report_source = ReportSource(
-                    pdf_url="업로드된 파일",
-                    text=report_text,
-                )
-            else:
-                st.warning("PDF에서 텍스트를 추출하지 못했습니다. 스캔본 여부를 확인해주세요.")
+    if st.button("PDF 다운로드 및 요약"):
+        item = st.session_state.items[idx]
 
-if st.session_state.scrape_warning:
-    st.warning(st.session_state.scrape_warning)
-
-if st.session_state.pdf_links:
-    selected_pdf = st.selectbox("발견된 PDF 링크", st.session_state.pdf_links)
-    if st.button("선택한 PDF 불러오기"):
         try:
-            pdf_bytes = download_pdf(selected_pdf)
-            report_text = extract_text_from_pdf(pdf_bytes)
-        except requests.RequestException:
-            st.error("PDF 다운로드에 실패했습니다. PDF를 직접 업로드해주세요.")
-            report_text = ""
-        except Exception:
-            st.error("PDF 파싱 오류가 발생했습니다. 다른 파일을 업로드해주세요.")
-            report_text = ""
-        if report_text:
-            st.session_state.report_text = report_text
-            st.session_state.report_source = ReportSource(
-                pdf_url=selected_pdf,
-                text=report_text,
-            )
-        else:
-            st.warning("PDF에서 텍스트를 추출하지 못했습니다. 스캔본 여부를 확인해주세요.")
+            pdf_url = extract_pdf_url(item["detailApiUrl"])
+            pdf_bytes = download_pdf(pdf_url)
+            text = extract_text_from_pdf(pdf_bytes)
 
-if st.session_state.report_source:
-    st.success("보고서 로딩 완료")
-    st.caption(f"사용한 소스: {st.session_state.report_source.pdf_url}")
+            client = get_openai_client()
+            with st.spinner("K-water 표준 A 요약 중..."):
+                summary = summarize_text(client, model, text)
 
-st.divider()
+            st.markdown(summary)
 
-st.subheader("요약")
-if st.button("요약 생성"):
-    if not api_key:
-        st.warning("OpenAI API Key를 입력하세요.")
-    elif not st.session_state.report_text:
-        st.warning("먼저 보고서를 불러오세요.")
-    else:
-        try:
-            client = get_openai_client(api_key)
-            with st.spinner("요약 생성 중..."):
-                st.session_state.summary = summarize_text(
-                    client, model, st.session_state.report_text
-                )
-        except Exception:
-            st.error("요약 생성 중 오류가 발생했습니다. API Key 또는 모델을 확인하세요.")
-
-if st.session_state.summary:
-    st.markdown(st.session_state.summary)
-
-if st.session_state.report_text:
-    with st.expander("원본 텍스트 미리보기"):
-        st.write(st.session_state.report_text[:preview_limit])
+        except Exception as e:
+            st.error(f"처리 실패: {e}")
